@@ -1,9 +1,58 @@
 from mycroft import MycroftSkill, intent_file_handler, intent_handler
 from adapt.intent import IntentBuilder # to use adapt itent parser
 from mycroft.skills.context import removes_context
-# from mycroft.messagebus.intent import IntentBuilder  # Correct import
+
+from mycroft.util import LOG
+import time
+import cv2
+import os
+import sys
+from multiprocessing import Process, Queue
+
+from .cvAPI import getObjLabel, getDetail
 
 LOGSTR = '********************====================########## '
+
+# mycroft-msm install https://github.com/ISA-SRBP/easy-shopping-skill.git
+
+# 'NO TEST': use the image taken by the camera
+# 'TEST': use the image in /photo folder, 
+# In both mode, camera will work normally, i.e. take the photo, save the photo
+# MODE = 'PROD'
+MODE = 'TEST'
+# need to be changed
+IMAGE_STORE_PATH = '/home/ky/mycroft-core/skills/easy-shopping-skill/photo/'
+# need to be changed
+TEST_IMAGE_PATH_MULTI = '/home/ky/mycroft-core/skills/easy-shopping-skill/testPhoto/multi.jpeg'
+# need to be changed
+TEST_IMAGE_PATH_HAND = '/home/ky/mycroft-core/skills/easy-shopping-skill/testPhoto/2.jpeg'
+
+    # WORKSHOP 3
+def take_photo(img_queue):
+    '''
+    Do taking photo
+    '''
+    LOG.info(LOGSTR + 'take photo process start')
+    cap = cv2.VideoCapture(0)
+    img_name = 'cap_img_' + str(time.time()) + '.jpg'
+    img_path = IMAGE_STORE_PATH + img_name # Remember to update path to image
+
+    #<-- Take photo in specific time duration -->
+    cout = 0
+    while True:
+        ret, frame = cap.read()
+        cv2.waitKey(1)
+        cv2.imshow('capture', frame)
+        cout += 1 
+        if cout == 50:
+            img_queue.put(img_path)
+            cv2.imwrite(img_path, frame)
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    LOG.info(LOGSTR + 'take photo process end')
+    os._exit(0)
 
 def generate_str(possible_list):
     '''
@@ -36,6 +85,9 @@ class EasyShopping(MycroftSkill):
         self.img_hand = ''
         self.log.info(LOGSTR + "_init_ EasyShoppingSkill")
 
+    def initialize(self):
+        self.reload_skill = False
+
     @intent_file_handler('shopping.easy.intent')
     def handle_shopping_easy(self, message):
         self.speak_dialog('shopping.easy')
@@ -50,10 +102,19 @@ class EasyShopping(MycroftSkill):
         self.img_multi = ''
         self.img_hand = ''
 
+        # step 1.2: create another process to do the photo taking
+        img_queue = Queue()
+        take_photo_process = Process(target=take_photo, args=(img_queue,))
+        take_photo_process.daemon = True
+        take_photo_process.start()
+        take_photo_process.join()
+        self.img_multi = img_queue.get()
+
+
         # suppose we use camera to take a photo here,
         # then the function will return an image path
-        self.img_multi = 'test img path'
-        self.speak('I found some goods here, you can ask me whatever goods you want.')
+        # self.img_multi = 'test img path'
+        self.speak('I find some goods here, you can ask me whatever goods you want.', expect_response=True)
 
     @intent_handler('is.there.any.goods.intent')
     def handle_is_there_any_goods(self, message):
@@ -61,32 +122,48 @@ class EasyShopping(MycroftSkill):
         if self.img_multi == '':
             self.handle_no_context1(message)
         else:
-                    
-            # in real application, label_str and loc_list will return from CV API
-            label_list = [['milk', 'drink', 'bottle'], ['milk', 'drink', 'bottle']]
-            loc_list = ['left top', 'right top']
+            # use try-catch block here, since there maybe error return from the cv api
+            try:        
+                self.log.info(LOGSTR + 'actual img path')
+                self.log.info(self.img_multi)
+                if MODE == 'TEST':
+                    self.log.info(LOGSTR + 'testing mode, use another image')
+                    self.img_multi = 'Path_To_Image/multi.jpeg' # e.g. self.img_multi = '/home/ai-user/mycroft-core/skills/easy-shopping-skill/cvAPI/test/photo/multi.jpeg'
 
-            category_label = message.data.get('category')
-            detected = 0
+                objectlist = getObjLabel.getObjectsThenLabel(self.img_multi)
+                label_list = []
+                loc_list = []
+                detected = 0
 
-            for i in range(len(label_list)):
-                label_str = generate_str(label_list[i])
-                label_str = label_str.lower()
+                category_label = message.data.get('category')
+    
+                for obj in objectlist['objectList']:
+                    label_list.append(obj['name'])
+                    loc_list.append(obj['loc'])
+            
+        
+                for i in range(0,len(label_list)):
+                    label_str = generate_str(label_list[i])
+                    label_str = label_str.lower()
+            
+                    if category_label is not None:
+                        if category_label in label_str:
+                            self.speak_dialog('yes.goods',
+                                        {'category': category_label,
+                                        'location': loc_list[i]})
+                            detected = 1
+                            break
+                    else:
+                        continue
+    
+                if detected == 0:
+                    self.speak_dialog('no.goods',
+                    {'category': category_label})
 
-                if category_label is not None:
-                    if category_label in label_str:
-                        self.speak_dialog('yes.goods',
-                                    {'category': category_label,
-                                    'location': loc_list[i]})
-                        detected = 1
-                        break
-                else:
-                    continue
-
-            if detected == 0:
-                self.speak_dialog('no.goods',
-                {'category': category_label})
-
+            except Exception as e:
+                self.log.error((LOGSTR + "Error: {0}").format(e))
+                self.speak_dialog(
+                "exception", {"action": "calling computer vision API"})
 
     def handle_no_context1(self,message):
         self.speak('Please let me have a look at what\'s in front of you first.')
@@ -102,30 +179,67 @@ class EasyShopping(MycroftSkill):
             self.speak('I cannot understand what you are saying')
 
     # USE CASE 2
-
+    def clear_all(self):
+        self.types_str = ''
+        self.color_str = ''
+        self.logo_str = ''
+        self.kw_str = ''
+        self.img_hand = ''
+        self.img_multi = ''
+        
     @intent_handler(IntentBuilder('ViewItemInHand').require('ViewItemInHandKeyWord'))
     def handle_view_item_in_hand(self, message):
         self.speak_dialog('take.photo')
         self.img_multi = ''
         self.img_hand = ''
     
-        # suppose we use camera to take a photo here, 
-        # then the function will return an image path
-        self.img_hand = 'Path_To_Image/2.jpeg'
+        # step 1.2: create another process to do the photo taking
+        img_queue = Queue()
+        take_photo_process = Process(target=take_photo, args=(img_queue,))
+        take_photo_process.daemon = True
+        take_photo_process.start()
+        take_photo_process.join()
+        self.img_hand = img_queue.get()
 
-        # suppose we call CV API here to get the result, 
-        # the result will all be list, then we use generate_str() to create string
-        self.category_str = generate_str(['milk', 'bottle', 'drink'])
-        self.brand_str = generate_str(['Dutch Lady', 'Lady'])
-        self.color_str = generate_str(['white', 'black', 'blue'])
-        self.kw_str = ' '.join(['milk', 'bottle', 'protein', 'pure', 'farm'])
+        # call cv api, and get result. 
+        try:
+            self.log.info(LOGSTR + 'actual img path')
+            self.log.info(self.img_hand)
+            if MODE != 'TEST':
+                self.log.info(LOGSTR + 'testing mode, use another image')
+                self.img_hand = TEST_IMAGE_PATH_HAND
 
-        # set the context
-        self.set_context('getDetailContext')
+            detail = getDetail(self.img_hand)
+            self.detail = detail
 
-        # speak dialog
-        self.speak_dialog('item.category', {'category': self.category_str})
+            self.category_str = generate_str(detail['objectLabel'])
 
+            if self.category_str != '':
+                self.set_context('getDetailContext')
+                self.speak_dialog(
+                    'item.category', {'category': self.category_str}, expect_response=True)
+
+                self.brand_str = generate_str(detail['objectLogo'])
+
+                color_list = []
+                for color in detail['objectColor']:
+                    color_list.append(color['colorName'])
+                self.color_str = generate_str(color_list)
+
+                self.kw_str = ' '.join(detail['objectText'])
+
+            else:
+                self.clear_all()
+                self.remove_context('getDetailContext')
+                self.speak(
+                    'I cannot understand what is in your hand. Maybe turn around it and let me see it again', expect_response=True)
+                
+
+        except Exception as e:
+            self.log.error((LOGSTR + "Error: {0}").format(e))
+            self.speak_dialog(
+                "exception", {"action": "calling computer vision API"})
+                
     @intent_handler(IntentBuilder('AskItemBrand').require('Brand').require('getDetailContext').build())
     def handle_ask_item_brand(self, message):
         self.handle_ask_item_detail('brand',self.brand_str)
@@ -188,4 +302,3 @@ class EasyShopping(MycroftSkill):
 
 def create_skill():
     return EasyShopping()
-
